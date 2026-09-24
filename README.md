@@ -25,7 +25,7 @@
 
 ## Preview / Screenshots
 
-> Place your screenshots under `docs/screenshots/` to enable these previews.
+
 
 ![Dialog 4G Widget](docs/screenshots/dialog_widget.png)
 
@@ -38,12 +38,6 @@ docs/screenshots/
 └── dialog_error.png       # Error / session-expired banner state (optional)
 ```
 
-Additional placeholders you can wire up once captured:
-
-```markdown
-![Dialog 4G on Desktop](docs/screenshots/dialog_desktop.png)
-![Dialog Error State](docs/screenshots/dialog_error.png)
-```
 
 ---
 
