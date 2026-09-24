@@ -248,7 +248,7 @@ def update_data_cycle():
             })
 
         # Save to data.json for Rainmeter (atomic so readers never see torn JSON)
-        updated_at = time.strftime("%H:%M:%S")
+        updated_at = time.strftime("%I:%M:%S %p")
         _data_tmp = DATA_FILE + ".tmp"
         with open(_data_tmp, "w", encoding="utf-8") as f:
             json.dump({
@@ -267,7 +267,7 @@ def update_data_cycle():
         print(f"[!] Fetch failed with status: {status}")
         # Write error state so the widget shows a message instead of stale blanks.
         try:
-            write_variables_inc([], "error", time.strftime("%H:%M:%S"))
+            write_variables_inc([], "error", time.strftime("%I:%M:%S %p"))
         except Exception as e:
             print(f"[!] Could not write error state: {e}")
 
