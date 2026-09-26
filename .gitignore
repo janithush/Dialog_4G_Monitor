@@ -13,3 +13,5 @@ DialogMonitor.lnk
 variables.inc
 cookies.json
 data.json
+.env
+*.tmp
