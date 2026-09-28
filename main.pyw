@@ -4,6 +4,32 @@ import sys
 import time
 
 
+# Anchor all relative files to script folder so Startup/headless runs work
+# even when CWD is System32 or elsewhere. Defined early so the
+# single-instance guard can signal via the trigger file BEFORE heavy
+# third-party imports (keeps the signal-and-exit path at ~0.1s).
+BASE_DIR_EARLY = os.path.dirname(os.path.abspath(__file__))
+TRIGGER_FILE_EARLY = os.path.join(BASE_DIR_EARLY, ".refresh.trigger")
+# Daemon trigger poll cadence (seconds). The daemon wakes every 1s to
+# consume refresh requests; periodic usage fetches still honor POLL_INTERVAL.
+TRIGGER_POLL_SECONDS = 1.0
+
+
+def _signal_daemon_refresh():
+    """Touch the refresh trigger file so a running daemon fetches ASAP.
+
+    Never raises — failures are logged only. Fast by design (~ms) so a
+    manual `--refresh` alongside a live daemon exits in ~0.1s.
+    """
+    try:
+        with open(TRIGGER_FILE_EARLY, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
+        return True
+    except Exception as e:
+        print(f"[!] Could not signal daemon refresh: {e}")
+        return False
+
+
 def _acquire_single_instance_mutex():
     """Create (or open) the global single-instance mutex.
 
@@ -30,12 +56,16 @@ def _acquire_single_instance_mutex():
         return False
 
 
-# CLI flag for on-demand manual sync (Rainmeter double-click action).
-# Parsed before the mutex guard so interactive runs can coexist with the daemon.
+# CLI flags for on-demand manual sync (Rainmeter double-click action).
+# Parsed before the mutex guard so interactive / refresh runs can coexist
+# with the daemon.
 INTERACTIVE_LOGIN = "--interactive-login" in sys.argv
+REFRESH_REQUESTED = "--refresh" in sys.argv
 SHOW_HELP = "--help" in sys.argv or "-h" in sys.argv
-# --help must never be blocked by the mutex either (read-only, no writes).
-BYPASS_SINGLE_INSTANCE_EXIT = INTERACTIVE_LOGIN or SHOW_HELP
+# --help / --refresh / --interactive-login must never be blocked by the
+# mutex without handling: --refresh signals the daemon and exits fast when
+# one is running, otherwise it auto-promotes to the daemon (see __main__).
+BYPASS_SINGLE_INSTANCE_EXIT = INTERACTIVE_LOGIN or REFRESH_REQUESTED or SHOW_HELP
 ANOTHER_INSTANCE_RUNNING = False
 _MUTEX_HANDLE = None
 
@@ -53,15 +83,31 @@ def _ensure_single_instance():
     write variables.inc -> !Refresh -> exit) so the user can force a
     re-login/sync via double-click without killing the background daemon.
     Atomic tmp+replace writes keep the brief overlap tear-free.
+
+    Exception: `--refresh` (lightweight manual sync) NEVER duplicates work.
+    If a daemon is already running it touches `.refresh.trigger` and exits
+    in ~0.1s (before heavy imports); the daemon picks it up on its 1s poll
+    and fetches immediately. Only when NO daemon is running does this
+    process continue — it then auto-promotes into the daemon loop.
     """
     global ANOTHER_INSTANCE_RUNNING
     ANOTHER_INSTANCE_RUNNING = _acquire_single_instance_mutex()
+    if ANOTHER_INSTANCE_RUNNING and REFRESH_REQUESTED and not INTERACTIVE_LOGIN:
+        # Fast path: signal the live daemon, exit before importing
+        # requests/playwright so double-click feels instant.
+        print("[*] Daemon already running — refresh requested.")
+        _signal_daemon_refresh()
+        os._exit(0)
     if ANOTHER_INSTANCE_RUNNING and not BYPASS_SINGLE_INSTANCE_EXIT:
         print("[!] Another instance is already running. Exiting.")
         os._exit(0)
     if ANOTHER_INSTANCE_RUNNING and INTERACTIVE_LOGIN:
         print("[*] Daemon already running — "
               "interactive sync will run one-shot alongside it.")
+    if ANOTHER_INSTANCE_RUNNING and REFRESH_REQUESTED and INTERACTIVE_LOGIN:
+        # Explicit headed re-login wins over lightweight signal; the
+        # interactive one-shot below handles it.
+        pass
 
 
 _ensure_single_instance()
@@ -71,8 +117,10 @@ import subprocess
 from playwright.sync_api import sync_playwright
 
 # Anchor all relative files to script folder so Startup/headless runs work
-# even when CWD is System32 or elsewhere.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# even when CWD is System32 or elsewhere. (BASE_DIR_EARLY above holds the
+# same value for pre-import use; reuse it here to keep a single source.)
+BASE_DIR = BASE_DIR_EARLY
+TRIGGER_FILE = TRIGGER_FILE_EARLY
 COOKIE_FILE = os.path.join(BASE_DIR, "cookies.json")
 DATA_FILE = os.path.join(BASE_DIR, "data.json")
 LOCAL_INC = os.path.join(BASE_DIR, "variables.inc")
@@ -113,15 +161,18 @@ def _load_dotenv(path=ENV_FILE):
 
 _load_dotenv()
 
-# Dialog identity / polling — configurable via .env, fallback to legacy defaults.
+# Dialog identity / polling — configurable via .env, fallback to defaults.
+# POLL_INTERVAL is the periodic background fetch cadence (default 15 min);
+# the daemon additionally wakes every TRIGGER_POLL_SECONDS (1s) to consume
+# `.refresh.trigger` requests for instant manual refreshes.
 DIALOG_MSISDN = os.environ.get("DIALOG_MSISDN", "337102988")
 DIALOG_UUID = os.environ.get(
     "DIALOG_UUID", "e8720ecf-3694-4ef1-9770-f5b0e2d1a462")
 DIALOG_LANG = os.environ.get("DIALOG_LANG", "en")
 try:
-    POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
+    POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "900"))
 except ValueError:
-    POLL_INTERVAL = 300
+    POLL_INTERVAL = 900
 
 
 def sanitize_inc(value):
@@ -531,7 +582,7 @@ def update_data_cycle(cookie_override=None):
 
 
 def run_interactive_login_once():
-    """On-demand manual sync for `--interactive-login` (double-click action).
+    """On-demand manual sync for `--interactive-login` (forced re-login).
 
     1. Headed browser login (OTP visible) -> capture cookies/bearer tokens.
     2. Persist to cookies.json + .env.
@@ -556,28 +607,142 @@ def run_interactive_login_once():
     return ok
 
 
+def consume_refresh_trigger():
+    """Consume a pending manual refresh request, if any.
+
+    Returns True if a `.refresh.trigger` file existed (and was removed),
+    False otherwise. Never raises. Retries once on Windows file-lock
+    races (AV/indexer holding the trigger for a few ms).
+    """
+    try:
+        if not os.path.exists(TRIGGER_FILE):
+            return False
+        try:
+            os.remove(TRIGGER_FILE)
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            # Transient lock (just-written trigger) — brief retry once.
+            try:
+                time.sleep(0.05)
+                os.remove(TRIGGER_FILE)
+            except FileNotFoundError:
+                pass
+        return True
+    except Exception as e:
+        print(f"[!] Could not consume refresh trigger: {e}")
+    return False
+
+
+def run_daemon_loop(initial_fetch_done=False):
+    """Standard background daemon loop (single owner of the mutex).
+
+    - Wakes every TRIGGER_POLL_SECONDS (1s) to consume `.refresh.trigger`
+      requests from manual `--refresh` launches for instant UI feedback.
+    - Does periodic usage fetches every POLL_INTERVAL (default 15 min).
+    - Never returns under normal operation; Ctrl+C breaks cleanly.
+    """
+    if initial_fetch_done:
+        # The caller just synced (instant UI feedback); drop any stale
+        # trigger so we don't fetch twice back-to-back, then schedule the
+        # next periodic fetch POLL_INTERVAL from now.
+        consume_refresh_trigger()
+        last_fetch = time.monotonic()
+        print(f"[*] Daemon loop started — trigger poll "
+              f"{TRIGGER_POLL_SECONDS:g}s, periodic fetch every "
+              f"{POLL_INTERVAL}s.")
+    else:
+        # Normal daemon startup: clear stale triggers, fetch immediately
+        # for instant UI, then enter the 1s/periodic schedule.
+        consume_refresh_trigger()
+        try:
+            update_data_cycle()
+        except Exception as e:
+            print(f"[!] Initial daemon fetch failed: {e}")
+        last_fetch = time.monotonic()
+        print(f"[*] Daemon loop started — trigger poll "
+              f"{TRIGGER_POLL_SECONDS:g}s, periodic fetch every "
+              f"{POLL_INTERVAL}s.")
+    while True:
+        try:
+            if consume_refresh_trigger():
+                print("[*] Manual refresh trigger consumed — fetching now.")
+                try:
+                    update_data_cycle()
+                except Exception as e:
+                    print(f"[!] Triggered fetch failed: {e}")
+                last_fetch = time.monotonic()
+                continue
+            elapsed = time.monotonic() - last_fetch
+            remaining = POLL_INTERVAL - elapsed
+            if remaining <= 0:
+                try:
+                    update_data_cycle()
+                except Exception as e:
+                    print(f"[!] Periodic fetch failed: {e}")
+                last_fetch = time.monotonic()
+                continue
+            time.sleep(min(TRIGGER_POLL_SECONDS, remaining))
+        except KeyboardInterrupt:
+            print("[*] Daemon loop interrupted — exiting.")
+            break
+        except Exception as e:
+            print(f"[!] Daemon loop error: {e}")
+            time.sleep(TRIGGER_POLL_SECONDS)
+
+
+def run_refresh_and_promote_to_daemon():
+    """Handle `main.pyw --refresh` when NO daemon is running (fail-safe).
+
+    1. Mutex is already held by this process (acquired in the guard).
+    2. Do an initial sync/fetch now for instant UI feedback.
+    3. DO NOT EXIT — transition into run_daemon_loop() so the system is
+       left with a running background daemon.
+    """
+    print("[*] No daemon detected — --refresh auto-promoting to daemon.")
+    print("[*] Performing initial sync for instant UI feedback...")
+    try:
+        update_data_cycle()
+        initial_done = True
+    except Exception as e:
+        print(f"[!] Initial refresh fetch failed: {e} — "
+              f"entering daemon loop to retry.")
+        initial_done = False
+    run_daemon_loop(initial_fetch_done=initial_done)
+
+
 if __name__ == "__main__":
     if "--help" in sys.argv or "-h" in sys.argv:
         print("Usage:")
-        print("  main.pyw                  Run background daemon (5-min loop).")
+        print(f"  main.pyw                  Run background daemon "
+              f"({POLL_INTERVAL // 60}-min periodic fetch, 1s trigger poll).")
+        print("  main.pyw --refresh        "
+              "Lightweight manual sync: signal daemon if running "
+              "(~0.1s exit), else fetch once and auto-promote to daemon.")
         print("  main.pyw --interactive-login  "
               "On-demand headed login + immediate sync + skin refresh.")
         sys.exit(0)
-    if INTERACTIVE_LOGIN:
+    if REFRESH_REQUESTED and not INTERACTIVE_LOGIN:
+        if ANOTHER_INSTANCE_RUNNING:
+            # Late safety net (the early pre-import fast path in
+            # _ensure_single_instance() normally handles this): signal
+            # the live daemon and exit immediately.
+            print("[*] Daemon already running — refresh requested.")
+            _signal_daemon_refresh()
+            sys.exit(0)
+        # Fail-safe: no daemon — fetch once, then stay as the daemon.
+        run_refresh_and_promote_to_daemon()
+    elif INTERACTIVE_LOGIN:
         ok = run_interactive_login_once()
         if ANOTHER_INSTANCE_RUNNING:
             # Daemon owns the loop — exit one-shot with status code.
             sys.exit(0 if ok else 1)
         # No daemon was running: stay alive as the daemon so the widget
-        # keeps refreshing every POLL_INTERVAL.
+        # keeps refreshing (1s trigger poll + periodic fetches).
         print("[*] No daemon was running — continuing as background daemon.")
         if not ok:
             # Still enter loop; next cycle retries automatically.
             pass
-        while True:
-            update_data_cycle()
-            time.sleep(POLL_INTERVAL)
+        run_daemon_loop(initial_fetch_done=ok)
     else:
-        while True:
-            update_data_cycle()
-            time.sleep(POLL_INTERVAL)  # Updates every 5 minutes by default
+        run_daemon_loop(initial_fetch_done=False)
