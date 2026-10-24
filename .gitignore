@@ -15,4 +15,7 @@ cookies.json
 data.json
 .env
 .refresh.trigger
+.paused
+daemon.log
+daemon.log.1
 *.tmp
